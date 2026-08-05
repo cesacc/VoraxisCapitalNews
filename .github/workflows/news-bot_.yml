@@ -1,0 +1,59 @@
+name: Aktien-News-Bot
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news-bot
+  cancel-in-progress: false
+
+jobs:
+  news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dauerlauf
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_ITEMS: "15"
+          # Sekunden zwischen zwei Pruefungen. Hoeher setzen, falls Quellen blocken.
+          INTERVALL: "60"
+          KEYWORDS: "Iran,Israel,Hormuz,Houthi,Ukraine,Russia,China,Taiwan,Venezuela,war,strike,attack,invasion,ceasefire,sanctions,military,tariff,tariffs,Trump,Fed,Powell,FOMC,rate cut,rate hike,inflation,CPI,PPI,jobs report,payrolls,unemployment,GDP,recession,yields,Treasury,dollar,Nasdaq,S&P 500,Dow Jones,Wall Street,stocks,futures,gold,bullion,XAU,silver,crude,oil price,OPEC,Nvidia,Apple,Microsoft,Tesla,Amazon,Meta,Broadcom,semiconductor,earnings"
+        run: |
+          git config user.name "news-bot"
+          git config user.email "bot@users.noreply.github.com"
+
+          sichern() {
+            git add seen.json
+            if ! git diff --staged --quiet; then
+              git commit -m "seen.json aktualisiert"
+              git pull --rebase --autostash || true
+              git push || true
+            fi
+          }
+
+          ENDE=$(( $(date +%s) + 21000 ))   # 5 Stunden 50 Minuten
+          RUNDE=0
+
+          while [ "$(date +%s)" -lt "$ENDE" ]; do
+            python aktien_news_bot.py || true
+            RUNDE=$((RUNDE + 1))
+            if [ $((RUNDE % 20)) -eq 0 ]; then
+              sichern
+            fi
+            sleep "$INTERVALL"
+          done
+
+          sichern
