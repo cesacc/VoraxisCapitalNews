@@ -2,15 +2,21 @@ name: Aktien-News-Bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # Alle 6 Stunden startet ein neuer Dauerlauf
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: news-bot
+  cancel-in-progress: false
+
 jobs:
   news:
     runs-on: ubuntu-latest
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v4
 
@@ -18,17 +24,37 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Bot ausfuehren
+      - name: Dauerlauf
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MAX_ITEMS: "15"
-        run: python aktien_news_bot.py
-
-      - name: Gesendete Artikel speichern
+          # Sekunden zwischen zwei Pruefungen. Hoeher setzen, falls Quellen blocken.
+          INTERVALL: "60"
         run: |
           git config user.name "news-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add seen.json
-          git diff --staged --quiet || git commit -m "seen.json aktualisiert"
-          git push
+
+          sichern() {
+            git add seen.json
+            if ! git diff --staged --quiet; then
+              git commit -m "seen.json aktualisiert"
+              git pull --rebase --autostash || true
+              git push || true
+            fi
+          }
+
+          ENDE=$(( $(date +%s) + 21000 ))   # 5 Stunden 50 Minuten
+          RUNDE=0
+
+          while [ "$(date +%s)" -lt "$ENDE" ]; do
+            python aktien_news_bot.py || true
+            RUNDE=$((RUNDE + 1))
+            # alle 20 Runden Zwischenstand sichern
+            if [ $((RUNDE % 20)) -eq 0 ]; then
+              sichern
+            fi
+            sleep "$INTERVALL"
+          done
+
+          sichern
