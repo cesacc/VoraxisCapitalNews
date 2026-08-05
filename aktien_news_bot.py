@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """
-Aktien-News-Bot fuer Telegram
-=============================
+Aktien-News-Bot fuer Telegram - Version 2 (GoldNews-Stil)
+==========================================================
 
-Holt aktuelle Boersen-News aus RSS-Feeds (USA + Deutschland) und schickt
-neue Meldungen per Telegram. Merkt sich bereits gesendete Artikel in
-seen.json, damit nichts doppelt kommt.
+Holt Boersen- und Geopolitik-News aus RSS-Feeds und schickt jede Meldung
+als einzelne Telegram-Nachricht mit Warn-Emoji. Merkt sich Gesendetes in
+seen.json.
 
-Benoetigt nur die Python-Standardbibliothek (kein pip install noetig).
+Benoetigt nur die Python-Standardbibliothek.
 
 Umgebungsvariablen:
   TELEGRAM_TOKEN    Pflicht. Token von @BotFather
   TELEGRAM_CHAT_ID  Pflicht. Deine Chat-ID
-  KEYWORDS          Optional. Kommagetrennt, z.B. "Nvidia,Tesla,Fed"
-                    Wenn gesetzt, werden nur passende Meldungen geschickt.
+  KEYWORDS          Optional. Kommagetrennt. Nur passende Meldungen.
   MAX_ITEMS         Optional. Max. Meldungen pro Durchlauf (Default 15)
-
-Start:
-  TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=... python3 aktien_news_bot.py
+  EINZELN           Optional. "1" = eine Nachricht pro Meldung (Default),
+                    "0" = gesammelte Liste
+  MIT_QUELLE        Optional. "1" = Quelle klein darunter (Default), "0" = ohne
 """
 
 import html
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,25 +31,34 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # --------------------------------------------------------------------------
-# Feeds - hier kannst du beliebig ergaenzen oder auskommentieren
+# Feeds
 # --------------------------------------------------------------------------
 FEEDS = {
-    # USA
-    "US | Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
-    "US | CNBC Markets": "https://www.cnbc.com/id/10000664/device/rss/rss.html",
-    "US | MarketWatch": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
-    "US | Investing.com": "https://www.investing.com/rss/news_25.rss",
-    # Deutschland
-    "DE | Handelsblatt Finanzen": "https://www.handelsblatt.com/contentexport/feed/finanzen",
-    "DE | finanzen.net": "https://www.finanzen.net/rss/news",
-    "DE | manager magazin": "https://www.manager-magazin.de/finanzen/index.rss",
-    "DE | tagesschau Wirtschaft": "https://www.tagesschau.de/wirtschaft/index~rss2.xml",
+    # --- Geopolitik: bewegt vor allem Gold (sicherer Hafen) ---
+    "Welt": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "Nahost": "https://www.aljazeera.com/xml/rss/all.xml",
+
+    # --- US-Maerkte: Nasdaq und S&P 500 ---
+    "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
+    "CNBC Markets": "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+    "MarketWatch": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "Investing.com": "https://www.investing.com/rss/news_25.rss",
+
+    # --- Rohstoffe und Devisen: bewegt Gold ---
+    "FXStreet": "https://www.fxstreet.com/rss",
+    "ForexLive": "https://www.forexlive.com/feed/news",
+
+    # --- Gezielte Suchfeeds ---
+    "Nasdaq & S&P": "https://news.google.com/rss/search?q=Nasdaq+OR+%22S%26P+500%22&hl=en-US&gl=US&ceid=US:en",
+    "Gold": "https://news.google.com/rss/search?q=%22gold+price%22+OR+%22gold+futures%22&hl=en-US&gl=US&ceid=US:en",
+    "Fed": "https://news.google.com/rss/search?q=Federal+Reserve+OR+Powell+OR+%22rate+cut%22&hl=en-US&gl=US&ceid=US:en",
 }
 
 SEEN_FILE = Path(__file__).with_name("seen.json")
-SEEN_LIMIT = 800          # so viele IDs werden gemerkt
-TELEGRAM_LIMIT = 3800     # Zeichen pro Nachricht (Telegram erlaubt 4096)
-USER_AGENT = "Mozilla/5.0 (compatible; AktienNewsBot/1.0)"
+SEEN_LIMIT = 800
+TELEGRAM_LIMIT = 3800
+USER_AGENT = "Mozilla/5.0 (compatible; AktienNewsBot/2.0)"
+PAUSE = 1.2  # Sekunden zwischen zwei Telegram-Nachrichten
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -58,8 +67,42 @@ NS = {
 
 
 # --------------------------------------------------------------------------
-# Hilfsfunktionen
+# Kategorien: erstes passendes Symbol gewinnt
 # --------------------------------------------------------------------------
+KATEGORIEN = [
+    ("\U0001F30D", [  # Geopolitik
+        "iran", "israel", "hormuz", "houthi", "ukraine", "russia", "taiwan",
+        "venezuela", "war", "invasion", "ceasefire", "sanction", "missile",
+        "airstrike", "attack", "military", "nato", "conflict",
+    ]),
+    ("\U0001F1FA\U0001F1F8", [  # Politik USA / Zoelle
+        "trump", "tariff", "white house", "congress", "shutdown", "election",
+    ]),
+    ("\U0001F3E6", [  # Notenbank / Konjunktur
+        "fed", "powell", "fomc", "rate cut", "rate hike", "inflation", "cpi",
+        "ppi", "payroll", "jobs report", "unemployment", "gdp", "recession",
+        "yield", "treasury", "ecb", "boj",
+    ]),
+    ("\U0001F7E1", [  # Gold und Rohstoffe
+        "gold", "bullion", "xau", "silver", "crude", "oil price", "opec",
+        "commodit",
+    ]),
+    ("\U0001F4C8", [  # Aktien und Indizes
+        "nasdaq", "s&p", "dow jones", "wall street", "stocks", "shares",
+        "earnings", "nvidia", "apple", "microsoft", "tesla", "amazon",
+        "broadcom", "semiconductor", "chip",
+    ]),
+]
+
+
+def symbol(titel):
+    t = titel.lower()
+    for zeichen, woerter in KATEGORIEN:
+        if any(w in t for w in woerter):
+            return zeichen
+    return "\u26a0\ufe0f"
+
+
 def fetch(url, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -73,11 +116,9 @@ def text_of(element):
 
 
 def parse_feed(raw):
-    """Liest RSS 2.0 und Atom und gibt eine Liste von (id, titel, link) zurueck."""
     items = []
     root = ET.fromstring(raw)
 
-    # RSS 2.0
     for item in root.findall(".//item"):
         title = text_of(item.find("title"))
         link = text_of(item.find("link"))
@@ -85,7 +126,6 @@ def parse_feed(raw):
         if title and link:
             items.append((guid, title, link))
 
-    # Atom
     for entry in root.findall(".//atom:entry", NS):
         title = text_of(entry.find("atom:title", NS))
         link_el = entry.find("atom:link", NS)
@@ -95,6 +135,17 @@ def parse_feed(raw):
             items.append((guid, title, link))
 
     return items
+
+
+def kuerzen(titel, grenze=200):
+    """Sehr lange Ueberschriften abschneiden, damit es aufgeraeumt bleibt."""
+    titel = titel.strip()
+    # Manche Feeds haengen die Quelle mit " - Name" an -> abtrennen
+    if " - " in titel and len(titel.rsplit(" - ", 1)[1]) < 30:
+        titel = titel.rsplit(" - ", 1)[0]
+    if len(titel) > grenze:
+        titel = titel[:grenze].rsplit(" ", 1)[0] + " ..."
+    return titel
 
 
 def load_seen():
@@ -136,7 +187,6 @@ def send_telegram(token, chat_id, text):
 
 
 def chunk_messages(lines):
-    """Packt Zeilen in Nachrichten, die unter dem Telegram-Limit bleiben."""
     blocks, current = [], ""
     for line in lines:
         if len(current) + len(line) > TELEGRAM_LIMIT and current:
@@ -148,9 +198,6 @@ def chunk_messages(lines):
     return blocks
 
 
-# --------------------------------------------------------------------------
-# Hauptprogramm
-# --------------------------------------------------------------------------
 def main():
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -159,6 +206,8 @@ def main():
 
     keywords = [k.strip().lower() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
     max_items = int(os.environ.get("MAX_ITEMS", "15"))
+    einzeln = os.environ.get("EINZELN", "1") == "1"
+    mit_quelle = os.environ.get("MIT_QUELLE", "1") == "1"
 
     seen = load_seen()
     seen_set = set(seen)
@@ -171,19 +220,17 @@ def main():
             print(f"! {source} nicht erreichbar: {err}")
             continue
 
-        new_here = 0
+        neu = 0
         for guid, title, link in items:
             if guid in seen_set:
                 continue
-            if keywords and not any(k in title.lower() for k in keywords):
-                seen_set.add(guid)
-                seen.append(guid)
-                continue
             seen_set.add(guid)
             seen.append(guid)
-            fresh.append((source, title, link))
-            new_here += 1
-        print(f"  {source}: {len(items)} Eintraege, {new_here} neu")
+            if keywords and not any(k in title.lower() for k in keywords):
+                continue
+            fresh.append((source, kuerzen(title), link))
+            neu += 1
+        print(f"  {source}: {len(items)} Eintraege, {neu} neu")
 
     if not fresh:
         save_seen(seen)
@@ -191,14 +238,26 @@ def main():
         return
 
     fresh = fresh[:max_items]
-    lines = ["<b>📈 Aktuelle Börsen-News</b>\n\n"]
-    for source, title, link in fresh:
-        lines.append(
-            f"<b>{html.escape(source)}</b>\n"
-            f'<a href="{html.escape(link, quote=True)}">{html.escape(title)}</a>\n\n'
-        )
+    ok = True
 
-    ok = all(send_telegram(token, chat_id, block) for block in chunk_messages(lines))
+    if einzeln:
+        for source, title, link in fresh:
+            text = f'{symbol(title)} <a href="{html.escape(link, quote=True)}">{html.escape(title)}</a>'
+            if mit_quelle:
+                text += f"\n\n<i>{html.escape(source)}</i>"
+            if not send_telegram(token, chat_id, text):
+                ok = False
+                break
+            time.sleep(PAUSE)
+    else:
+        lines = ["<b>📈 Aktuelle Börsen-News</b>\n\n"]
+        for source, title, link in fresh:
+            lines.append(
+                f'{symbol(title)} <a href="{html.escape(link, quote=True)}">{html.escape(title)}</a>\n'
+                f"<i>{html.escape(source)}</i>\n\n"
+            )
+        ok = all(send_telegram(token, chat_id, b) for b in chunk_messages(lines))
+
     if ok:
         save_seen(seen)
         print(f"{len(fresh)} Meldungen gesendet.")
