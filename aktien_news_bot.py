@@ -17,13 +17,17 @@ Umgebungsvariablen:
   EINZELN           Optional. "1" = eine Nachricht pro Meldung (Default),
                     "0" = gesammelte Liste
   MIT_QUELLE        Optional. "1" = Quelle klein darunter (Default), "0" = ohne
+  MAX_ALTER_STUNDEN Optional. Meldungen aelter als X Stunden werden
+                    uebersprungen (Default 12)
 """
 
+import email.utils
 import html
 import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,7 +43,6 @@ FEEDS = {
     "Nahost": "https://www.aljazeera.com/xml/rss/all.xml",
 
     # --- US-Maerkte: Nasdaq und S&P 500 ---
-    "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
     "CNBC Markets": "https://www.cnbc.com/id/10000664/device/rss/rss.html",
     "MarketWatch": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "Investing.com": "https://www.investing.com/rss/news_25.rss",
@@ -53,6 +56,16 @@ FEEDS = {
     "Gold": "https://news.google.com/rss/search?q=%22gold+price%22+OR+%22gold+futures%22&hl=en-US&gl=US&ceid=US:en",
     "Fed": "https://news.google.com/rss/search?q=Federal+Reserve+OR+Powell+OR+%22rate+cut%22&hl=en-US&gl=US&ceid=US:en",
 }
+
+# Ueberschriften mit diesen Begriffen werden nie verschickt (Ratgeber, Clickbait)
+AUSSCHLUSS = [
+    "heloc", "cd rate", "mortgage rate", "savings account", "apy",
+    "credit card", "personal loan", "refinance", "home equity", "insurance",
+    "retirement", "401(k)", "how to", "should you", "here's why i",
+    "here are 3 reasons", "reasons i'm", "best stocks to buy", "motley",
+    "dividend stock", "my top", "i'm buying", "prediction:", "better buy",
+    "what to know", "explained:", "quiz", "horoscope", "recipe",
+]
 
 SEEN_FILE = Path(__file__).with_name("seen.json")
 SEEN_LIMIT = 800
@@ -115,6 +128,24 @@ def text_of(element):
     return " ".join((element.text or "").split())
 
 
+def zeitstempel(text):
+    """Wandelt ein Datum aus dem Feed in eine Zeit um. None, wenn unlesbar."""
+    if not text:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def parse_feed(raw):
     items = []
     root = ET.fromstring(raw)
@@ -123,16 +154,18 @@ def parse_feed(raw):
         title = text_of(item.find("title"))
         link = text_of(item.find("link"))
         guid = text_of(item.find("guid")) or link
+        dt = zeitstempel(text_of(item.find("pubDate")))
         if title and link:
-            items.append((guid, title, link))
+            items.append((guid, title, link, dt))
 
     for entry in root.findall(".//atom:entry", NS):
         title = text_of(entry.find("atom:title", NS))
         link_el = entry.find("atom:link", NS)
         link = link_el.get("href", "") if link_el is not None else ""
         guid = text_of(entry.find("atom:id", NS)) or link
+        dt = zeitstempel(text_of(entry.find("atom:updated", NS)))
         if title and link:
-            items.append((guid, title, link))
+            items.append((guid, title, link, dt))
 
     return items
 
@@ -207,6 +240,8 @@ def main():
     keywords = [k.strip().lower() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
     max_items = int(os.environ.get("MAX_ITEMS", "15"))
     einzeln = os.environ.get("EINZELN", "1") == "1"
+    max_alter = int(os.environ.get("MAX_ALTER_STUNDEN", "12"))
+    grenze = datetime.now(timezone.utc) - timedelta(hours=max_alter)
     mit_quelle = os.environ.get("MIT_QUELLE", "1") == "1"
 
     seen = load_seen()
@@ -221,12 +256,17 @@ def main():
             continue
 
         neu = 0
-        for guid, title, link in items:
+        for guid, title, link, dt in items:
             if guid in seen_set:
                 continue
             seen_set.add(guid)
             seen.append(guid)
-            if keywords and not any(k in title.lower() for k in keywords):
+            if dt is not None and dt < grenze:
+                continue
+            tl = title.lower()
+            if any(a in tl for a in AUSSCHLUSS):
+                continue
+            if keywords and not any(k in tl for k in keywords):
                 continue
             fresh.append((source, kuerzen(title), link))
             neu += 1
